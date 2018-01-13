@@ -7,6 +7,7 @@
 #include "shared.h"
 #include <mutex>
 #include "MinHook.h"
+#include "NtSection.hpp"
 
 using namespace std;
 
@@ -22,6 +23,7 @@ PktHeader header;
 LPVOID recvDetour = NULL, sendDetour = NULL;
 volatile long cmsgCount = 0L, smsgCount = 0L;
 volatile bool isRuning = false;
+unique_ptr<NtSection> section;
 
 char dllPath[MAX_PATH] = { NULL };
 
@@ -240,6 +242,51 @@ bool CreateConsole()
     return true;
 }
 
+bool IsObfuscated()
+{
+    return header.Build >= 24744;
+}
+
+bool CopyCodeSection(unique_ptr<NtSection> &section)
+{
+    if (!IsObfuscated())
+        return true;
+
+    HANDLE hProcess = GetCurrentProcess();
+    if (!hProcess)
+    {
+        printf("Process open failed.\n");
+        return false;
+    }
+    section = NtSection::CopyCodeSection(hProcess);
+    if (!section)
+    {
+        printf("Copy code section failed.\n");
+        CloseHandle(hProcess);
+        return false;
+    }
+    return true;
+}
+
+bool CreateWriteableView(LPVOID &writeableView)
+{
+    if (!IsObfuscated())
+        return true;
+    
+    if (writeableView = section->CreateView(PAGE_EXECUTE_READWRITE))
+        return true;
+    return false;
+}
+
+void DestroyView(LPVOID &writeableView)
+{
+    if (!IsObfuscated())
+        return;
+    
+    if (writeableView)
+        section->DestroyView(writeableView);
+}
+
 DWORD MainThreadControl(LPVOID  param)
 {
     if (!CreateConsole())
@@ -314,19 +361,34 @@ DWORD MainThreadControl(LPVOID  param)
     printf("Found '%s' hooks!\n", proto.name);
 #endif
 
-    MH_STATUS status = MH_CreateHook((LPVOID)(baseAddress + offsets.send), proto.send, &sendDetour);
+    CopyCodeSection(section);
+
+    LPVOID writeableView = 0;
+    if (!CreateWriteableView(writeableView))
+    {
+        printf("\nERROR create writeable view\n");
+        system("pause");
+        FreeLibraryAndExitThread(instanceDLL, 0);
+    }
+    long long writableViewAddress = (long long)writeableView;
+    if (!IsObfuscated())
+        writableViewAddress = baseAddress;
+
+    MH_STATUS status = MH_CreateHookWithView((LPVOID)(baseAddress + offsets.send), (LPVOID)(writableViewAddress + offsets.send), proto.send, &sendDetour);
     if (status != MH_OK)
     {
         printf("\nERROR create send '%s' hook (%u) '%s'\n", proto.name, status, MH_StatusToString(status));
         system("pause");
+        DestroyView(writeableView);
         FreeLibraryAndExitThread(instanceDLL, 0);
     }
 
-    status = MH_CreateHook((LPVOID)(baseAddress + offsets.recv), proto.recv, &recvDetour);
+    status = MH_CreateHookWithView((LPVOID)(baseAddress + offsets.recv), (LPVOID)(writableViewAddress + offsets.recv), proto.recv, &recvDetour);
     if (status != MH_OK)
     {
         printf("\nERROR create recv '%s' hook (%u) '%s'\n", proto.name, status, MH_StatusToString(status));
         system("pause");
+        DestroyView(writeableView);
         FreeLibraryAndExitThread(instanceDLL, 0);
     }
 
@@ -335,6 +397,7 @@ DWORD MainThreadControl(LPVOID  param)
     {
         printf("\nERROR enable '%s' hooks (%u) '%s'\n", proto.name, status, MH_StatusToString(status));
         system("pause");
+        DestroyView(writeableView);
         FreeLibraryAndExitThread(instanceDLL, 0);
     }
 
@@ -352,6 +415,7 @@ DWORD MainThreadControl(LPVOID  param)
     }
 
     MH_DisableHook(MH_ALL_HOOKS);
+    DestroyView(writeableView);
     printf("All hook disabled.\n");
     FreeConsole();
     FreeLibraryAndExitThread(instanceDLL, 0);
